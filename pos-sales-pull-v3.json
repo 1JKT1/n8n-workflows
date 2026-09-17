@@ -1,0 +1,54 @@
+{
+  "name": "POS Sales Pull v3",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 1 * * 0"
+            }
+          ]
+        }
+      },
+      "id": "c3d4e5f6-0001-4000-8000-000000000021",
+      "name": "Weekly Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "url": "https://abbiescigars.phppointofsale.com/index.php/api/v1/sales?start_date=2026-09-06T00:00:00-04:00&end_date=2026-09-12T23:59:59-04:00",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {}
+      },
+      "id": "c3d4e5f6-0002-4000-8000-000000000022",
+      "name": "Fetch Sales",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [220, 0],
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "PHP POS API v2"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Weekly Trigger": {
+      "main": [
+        [
+          {
+            "node": "Fetch Sales",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {}
+}
