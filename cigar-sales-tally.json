@@ -1,0 +1,204 @@
+{
+  "name": "Cigar Sales Tally",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "30 2 * * 0"
+            }
+          ]
+        }
+      },
+      "id": "c9d0e1f2-0001-4000-8000-000000000101",
+      "name": "Weekly Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Trailing 28-day window ending at the close of the last complete week.\n// Matches the stock snapshot's as-of date so the two files describe the\n// same moment.\n\nconst now = $now.setZone('America/New_York');\nconst dayOfWeek = now.weekday % 7;\nconst currentWeekStart = now.minus({ days: dayOfWeek }).startOf('day');\n\nconst windowEnd = currentWeekStart.minus({ seconds: 1 });\nconst windowStart = windowEnd.minus({ days: 28 }).startOf('day');\n\nconst fmt = \"yyyy-MM-dd'T'HH:mm:ssZZ\";\nconst year = windowEnd.toFormat('yyyy');\nconst month = windowEnd.toFormat('MM-MMMM');\nconst asOf = windowEnd.toFormat('yyyy-MM-dd');\n\nreturn [{\n  json: {\n    start_date: windowStart.toFormat(fmt),\n    end_date: windowEnd.toFormat(fmt),\n    window_start_label: windowStart.toFormat('yyyy-MM-dd'),\n    window_end_label: asOf,\n    period_days: Math.round(windowEnd.diff(windowStart, 'days').days),\n    stock_path: `business-decisions-data/cigar-stock/${year}/${month}/${asOf}-cigar-stock.csv`,\n    file_path: `business-decisions-data/cigar-inventory/${year}/${month}/${asOf}-cigar-inventory.csv`,\n    generated_at: now.toFormat(fmt)\n  }\n}];"
+      },
+      "id": "c9d0e1f2-0002-4000-8000-000000000102",
+      "name": "Build Window",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [220, 0],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "resource": "file",
+        "operation": "get",
+        "owner": { "__rl": true, "value": "1JKT1", "mode": "name" },
+        "repository": { "__rl": true, "value": "abbies-data", "mode": "name" },
+        "filePath": "={{ $json.stock_path }}",
+        "asBinaryProperty": false,
+        "additionalParameters": {}
+      },
+      "id": "c9d0e1f2-0003-4000-8000-000000000103",
+      "name": "Fetch Stock File",
+      "type": "n8n-nodes-base.github",
+      "typeVersion": 1,
+      "position": [440, 0],
+      "onError": "continueErrorOutput",
+      "credentials": { "githubApi": { "name": "GitHub Abbies Data" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse the stock CSV written by Cigar Stock Snapshot. The GitHub node may\n// return the content decoded or base64-encoded depending on version, so\n// handle both rather than assuming.\n\nconst win = $('Build Window').all()[0].json;\nconst j = items[0].json;\n\nlet text = j.content || j.data || j.file_content || '';\n\nif (typeof text !== 'string' || !text) {\n  throw new Error('Stock file returned no content. Expected ' + win.stock_path);\n}\n\n// Base64 if it has no comma and no newline but looks encoded.\nif (!text.includes(',') && !text.includes('\\n')) {\n  try { text = Buffer.from(text, 'base64').toString('utf8'); } catch (e) {}\n} else if (/^[A-Za-z0-9+/=\\s]+$/.test(text) && !text.includes('item_id')) {\n  try { text = Buffer.from(text, 'base64').toString('utf8'); } catch (e) {}\n}\n\nconst rows = text.split('\\n').filter(l => l.trim().length);\nif (rows.length < 2) {\n  throw new Error('Stock file has no data rows: ' + win.stock_path);\n}\n\nfunction splitCsv(line) {\n  const out = [];\n  let cur = '';\n  let inQ = false;\n  for (let i = 0; i < line.length; i++) {\n    const ch = line[i];\n    if (inQ) {\n      if (ch === '\"') {\n        if (line[i + 1] === '\"') { cur += '\"'; i++; } else { inQ = false; }\n      } else { cur += ch; }\n    } else if (ch === '\"') { inQ = true; }\n    else if (ch === ',') { out.push(cur); cur = ''; }\n    else { cur += ch; }\n  }\n  out.push(cur);\n  return out;\n}\n\nconst header = splitCsv(rows[0]).map(h => h.trim());\nconst idx = {};\nheader.forEach((h, i) => { idx[h] = i; });\n\nfor (const needed of ['item_id', 'sku', 'name', 'on_hand', 'unit_cost']) {\n  if (!(needed in idx)) throw new Error('Stock file missing column: ' + needed);\n}\n\nconst stock = [];\nfor (let r = 1; r < rows.length; r++) {\n  const c = splitCsv(rows[r]);\n  stock.push({\n    item_id: String(c[idx.item_id]),\n    sku: c[idx.sku],\n    name: c[idx.name],\n    on_hand: Number(c[idx.on_hand]) || 0,\n    unit_cost: Number(c[idx.unit_cost]) || 0\n  });\n}\n\nreturn [{ json: { stock_count: stock.length, stock } }];"
+      },
+      "id": "c9d0e1f2-0004-4000-8000-000000000104",
+      "name": "Parse Stock",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [660, 0],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "url": "=https://abbiescigars.phppointofsale.com/index.php/api/v1/sales?start_date={{ $('Build Window').all()[0].json.start_date }}&end_date={{ $('Build Window').all()[0].json.end_date }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {}
+      },
+      "id": "c9d0e1f2-0005-4000-8000-000000000105",
+      "name": "Fetch Sales 28d",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [880, 0],
+      "onError": "continueErrorOutput",
+      "credentials": { "httpHeaderAuth": { "name": "PHP POS API v2" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Tally cigar units sold per item, join to stock, emit the analyst CSV:\n//   sku, name, units_sold, on_hand, unit_cost\n// Every carried cigar is a row, including ones that sold nothing.\n\nconst win = $('Build Window').all()[0].json;\nconst stock = $('Parse Stock').all()[0].json.stock;\n\n// Tally first, then let the raw sales go out of scope.\nconst sold = {};\nfor (const item of items) {\n  const sale = item.json;\n  const cart = sale.cart_items || [];\n  for (let i = 0; i < cart.length; i++) {\n    const c = cart[i];\n    if ((c.category_name || '') !== 'Cigars') continue;\n    const id = String(c.item_id);\n    sold[id] = (sold[id] || 0) + Number(c.quantity || 0);\n  }\n}\n\nfunction csvCell(v) {\n  const s = String(v === null || v === undefined ? '' : v);\n  return /[\",\\n]/.test(s) ? '\"' + s.replace(/\"/g, '\"\"') + '\"' : s;\n}\n\nconst lines = ['sku,name,units_sold,on_hand,unit_cost'];\nlet zeroSellers = 0;\n\nfor (const s of stock) {\n  const units = Math.round(sold[s.item_id] || 0);\n  if (units === 0) zeroSellers++;\n  lines.push([\n    csvCell(s.sku),\n    csvCell(s.name),\n    units,\n    s.on_hand,\n    s.unit_cost.toFixed(2)\n  ].join(','));\n}\n\nreturn [{\n  json: {\n    file_path: win.file_path,\n    window_label: `${win.window_start_label} to ${win.window_end_label}`,\n    period_days: win.period_days,\n    carried_skus: stock.length,\n    zero_sellers: zeroSellers,\n    commit_message: `Cigar inventory ${win.window_end_label} (${stock.length} SKUs, ${win.period_days}-day window, ${zeroSellers} with no sales)`,\n    file_content: lines.join('\\n') + '\\n'\n  }\n}];"
+      },
+      "id": "c9d0e1f2-0006-4000-8000-000000000106",
+      "name": "Build Analyst CSV",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1100, 0],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "resource": "file",
+        "operation": "create",
+        "owner": { "__rl": true, "value": "1JKT1", "mode": "name" },
+        "repository": { "__rl": true, "value": "abbies-data", "mode": "name" },
+        "filePath": "={{ $json.file_path }}",
+        "binaryData": false,
+        "fileContent": "={{ $json.file_content }}",
+        "commitMessage": "={{ $json.commit_message }}"
+      },
+      "id": "c9d0e1f2-0007-4000-8000-000000000107",
+      "name": "Create Inventory File",
+      "type": "n8n-nodes-base.github",
+      "typeVersion": 1,
+      "position": [1320, 0],
+      "onError": "continueErrorOutput",
+      "credentials": { "githubApi": { "name": "GitHub Abbies Data" } }
+    },
+    {
+      "parameters": {
+        "resource": "file",
+        "operation": "edit",
+        "owner": { "__rl": true, "value": "1JKT1", "mode": "name" },
+        "repository": { "__rl": true, "value": "abbies-data", "mode": "name" },
+        "filePath": "={{ $('Build Analyst CSV').all()[0].json.file_path }}",
+        "binaryData": false,
+        "fileContent": "={{ $('Build Analyst CSV').all()[0].json.file_content }}",
+        "commitMessage": "={{ $('Build Analyst CSV').all()[0].json.commit_message }} [rerun]"
+      },
+      "id": "c9d0e1f2-0008-4000-8000-000000000108",
+      "name": "Update Inventory File",
+      "type": "n8n-nodes-base.github",
+      "typeVersion": 1,
+      "position": [1540, 0],
+      "onError": "continueErrorOutput",
+      "credentials": { "githubApi": { "name": "GitHub Abbies Data" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const now = $now.setZone('America/New_York');\nconst stamp = now.toFormat('yyyy-MM-dd HH:mm:ss ZZZZ');\n\nconst first = (items && items[0] && items[0].json) ? items[0].json : {};\nconst raw = first.error;\n\nlet message = 'No error message available';\nlet detail = '';\n\nif (typeof raw === 'string') {\n  message = raw;\n  detail = raw;\n} else if (raw && typeof raw === 'object') {\n  message = raw.message || raw.description || raw.reason || message;\n  try { detail = JSON.stringify(raw, null, 2).slice(0, 4000); } catch (e) { detail = 'Could not serialize error payload.'; }\n} else {\n  try { detail = JSON.stringify(first, null, 2).slice(0, 4000); } catch (e) { detail = 'Could not serialize item.'; }\n}\n\nlet failedNode = 'unknown step';\ntry { if ($prevNode && $prevNode.name) failedNode = $prevNode.name; } catch (e) {}\n\nlet windowLabel = 'unknown';\nlet stockPath = 'unknown';\ntry {\n  const w = $('Build Window').all();\n  if (w.length) {\n    windowLabel = `${w[0].json.window_start_label} to ${w[0].json.window_end_label}`;\n    stockPath = w[0].json.stock_path;\n  }\n} catch (e) {}\n\nconst body = [\n  '**Cigar Sales Tally failed.**',\n  '',\n  `- Failed step: \\`${failedNode}\\``,\n  `- Time: ${stamp}`,\n  `- Window: ${windowLabel}`,\n  `- Stock file expected at: \\`${stockPath}\\``,\n  `- Execution ID: ${$execution.id}`,\n  '',\n  '### Error',\n  '```',\n  String(message),\n  '```',\n  '',\n  '### Raw payload',\n  '```json',\n  detail,\n  '```',\n  '',\n  '---',\n  'No inventory file was written. If this failed at Fetch Stock File, check that Cigar Stock Snapshot ran first.'\n].join('\\n');\n\nreturn [{\n  json: {\n    issue_title: `Cigar Sales Tally failed at ${failedNode} - ${now.toFormat('yyyy-MM-dd')}`,\n    issue_body: body\n  }\n}];"
+      },
+      "id": "c9d0e1f2-0009-4000-8000-000000000109",
+      "name": "Build Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1100, 240]
+    },
+    {
+      "parameters": {
+        "resource": "issue",
+        "operation": "create",
+        "owner": { "__rl": true, "value": "1JKT1", "mode": "name" },
+        "repository": { "__rl": true, "value": "abbies-data", "mode": "name" },
+        "title": "={{ $json.issue_title }}",
+        "body": "={{ $json.issue_body }}",
+        "labels": [],
+        "assignees": []
+      },
+      "id": "c9d0e1f2-0010-4000-8000-000000000110",
+      "name": "Report Failure",
+      "type": "n8n-nodes-base.github",
+      "typeVersion": 1,
+      "position": [1320, 240],
+      "credentials": { "githubApi": { "name": "GitHub Abbies Data" } }
+    }
+  ],
+  "connections": {
+    "Weekly Trigger": { "main": [[{ "node": "Build Window", "type": "main", "index": 0 }]] },
+    "Build Window": {
+      "main": [
+        [{ "node": "Fetch Stock File", "type": "main", "index": 0 }],
+        [{ "node": "Build Alert", "type": "main", "index": 0 }]
+      ]
+    },
+    "Fetch Stock File": {
+      "main": [
+        [{ "node": "Parse Stock", "type": "main", "index": 0 }],
+        [{ "node": "Build Alert", "type": "main", "index": 0 }]
+      ]
+    },
+    "Parse Stock": {
+      "main": [
+        [{ "node": "Fetch Sales 28d", "type": "main", "index": 0 }],
+        [{ "node": "Build Alert", "type": "main", "index": 0 }]
+      ]
+    },
+    "Fetch Sales 28d": {
+      "main": [
+        [{ "node": "Build Analyst CSV", "type": "main", "index": 0 }],
+        [{ "node": "Build Alert", "type": "main", "index": 0 }]
+      ]
+    },
+    "Build Analyst CSV": {
+      "main": [
+        [{ "node": "Create Inventory File", "type": "main", "index": 0 }],
+        [{ "node": "Build Alert", "type": "main", "index": 0 }]
+      ]
+    },
+    "Create Inventory File": {
+      "main": [
+        [],
+        [{ "node": "Update Inventory File", "type": "main", "index": 0 }]
+      ]
+    },
+    "Update Inventory File": {
+      "main": [
+        [],
+        [{ "node": "Build Alert", "type": "main", "index": 0 }]
+      ]
+    },
+    "Build Alert": { "main": [[{ "node": "Report Failure", "type": "main", "index": 0 }]] }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "America/New_York"
+  }
+}
