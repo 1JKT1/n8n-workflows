@@ -1,0 +1,209 @@
+{
+  "name": "Cigar Stock Snapshot",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 2 * * 0"
+            }
+          ]
+        }
+      },
+      "id": "b8c9d0e1-0001-4000-8000-000000000081",
+      "name": "Weekly Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Stock is a point-in-time reading, not a window. It is labelled with the\n// close of the last complete week so it lines up with the sales tally.\n\nconst now = $now.setZone('America/New_York');\nconst dayOfWeek = now.weekday % 7;\nconst currentWeekStart = now.minus({ days: dayOfWeek }).startOf('day');\nconst asOf = currentWeekStart.minus({ seconds: 1 });\n\nconst fmt = \"yyyy-MM-dd'T'HH:mm:ssZZ\";\nconst year = asOf.toFormat('yyyy');\nconst month = asOf.toFormat('MM-MMMM');\nconst fileName = asOf.toFormat('yyyy-MM-dd') + '-cigar-stock.csv';\n\nreturn [{\n  json: {\n    as_of_label: asOf.toFormat('yyyy-MM-dd'),\n    file_path: `business-decisions-data/cigar-stock/${year}/${month}/${fileName}`,\n    generated_at: now.toFormat(fmt)\n  }\n}];"
+      },
+      "id": "b8c9d0e1-0002-4000-8000-000000000082",
+      "name": "Build Window",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [220, 0],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "url": "https://abbiescigars.phppointofsale.com/index.php/api/v1/categories?limit=100",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {}
+      },
+      "id": "b8c9d0e1-0003-4000-8000-000000000083",
+      "name": "Fetch Categories",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [440, 0],
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "PHP POS API v2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const cats = items.map(i => i.json);\nconst match = cats.find(c => String(c.name || '').trim().toLowerCase() === 'cigars');\n\nif (!match) {\n  throw new Error('No category named \"Cigars\" found. Categories present: ' + cats.map(c => c.name).join(', '));\n}\n\nreturn [{ json: { category_id: match.category_id, category_name: match.name } }];"
+      },
+      "id": "b8c9d0e1-0004-4000-8000-000000000084",
+      "name": "Find Cigars Category",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [660, 0],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "url": "=https://abbiescigars.phppointofsale.com/index.php/api/v1/items?category_id={{ $json.category_id }}&limit=1000",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {}
+      },
+      "id": "b8c9d0e1-0005-4000-8000-000000000085",
+      "name": "Fetch Items",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [880, 0],
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "PHP POS API v2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Reduce full item objects (images, variations, tier pricing, location blocks)\n// down to the four fields the analyst needs. This is the only large payload\n// in this execution; no sales data is present.\n\nconst win = $('Build Window').all()[0].json;\nconst itemRows = items.map(i => i.json);\n\nif (!itemRows.length) {\n  throw new Error('No cigar items returned from /items.');\n}\n\nfunction onHandFor(item) {\n  const loc = item.locations;\n  if (!loc || typeof loc !== 'object') return 0;\n  let total = 0;\n  for (const k of Object.keys(loc)) {\n    const n = Number(loc[k] && loc[k].quantity);\n    if (!isNaN(n)) total += n;\n  }\n  return total;\n}\n\nfunction csvCell(v) {\n  const s = String(v === null || v === undefined ? '' : v);\n  return /[\",\\n]/.test(s) ? '\"' + s.replace(/\"/g, '\"\"') + '\"' : s;\n}\n\nconst lines = ['item_id,sku,name,on_hand,unit_cost'];\nlet carried = 0;\n\nfor (const item of itemRows) {\n  if (item.item_inactive === true) continue;\n  carried++;\n  lines.push([\n    csvCell(item.item_id),\n    csvCell(item.item_number || item.item_id),\n    csvCell(item.name),\n    Math.max(0, Math.round(onHandFor(item))),\n    Number(item.cost_price || 0).toFixed(2)\n  ].join(','));\n}\n\nreturn [{\n  json: {\n    file_path: win.file_path,\n    as_of: win.as_of_label,\n    carried_skus: carried,\n    commit_message: `Cigar stock snapshot ${win.as_of_label} (${carried} SKUs)`,\n    file_content: lines.join('\\n') + '\\n'\n  }\n}];"
+      },
+      "id": "b8c9d0e1-0006-4000-8000-000000000086",
+      "name": "Build Stock CSV",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1100, 0],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "resource": "file",
+        "operation": "create",
+        "owner": { "__rl": true, "value": "1JKT1", "mode": "name" },
+        "repository": { "__rl": true, "value": "abbies-data", "mode": "name" },
+        "filePath": "={{ $json.file_path }}",
+        "binaryData": false,
+        "fileContent": "={{ $json.file_content }}",
+        "commitMessage": "={{ $json.commit_message }}"
+      },
+      "id": "b8c9d0e1-0007-4000-8000-000000000087",
+      "name": "Create Stock File",
+      "type": "n8n-nodes-base.github",
+      "typeVersion": 1,
+      "position": [1320, 0],
+      "onError": "continueErrorOutput",
+      "credentials": { "githubApi": { "name": "GitHub Abbies Data" } }
+    },
+    {
+      "parameters": {
+        "resource": "file",
+        "operation": "edit",
+        "owner": { "__rl": true, "value": "1JKT1", "mode": "name" },
+        "repository": { "__rl": true, "value": "abbies-data", "mode": "name" },
+        "filePath": "={{ $('Build Stock CSV').all()[0].json.file_path }}",
+        "binaryData": false,
+        "fileContent": "={{ $('Build Stock CSV').all()[0].json.file_content }}",
+        "commitMessage": "={{ $('Build Stock CSV').all()[0].json.commit_message }} [rerun]"
+      },
+      "id": "b8c9d0e1-0008-4000-8000-000000000088",
+      "name": "Update Stock File",
+      "type": "n8n-nodes-base.github",
+      "typeVersion": 1,
+      "position": [1540, 0],
+      "onError": "continueErrorOutput",
+      "credentials": { "githubApi": { "name": "GitHub Abbies Data" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const now = $now.setZone('America/New_York');\nconst stamp = now.toFormat('yyyy-MM-dd HH:mm:ss ZZZZ');\n\nconst first = (items && items[0] && items[0].json) ? items[0].json : {};\nconst raw = first.error;\n\nlet message = 'No error message available';\nlet detail = '';\n\nif (typeof raw === 'string') {\n  message = raw;\n  detail = raw;\n} else if (raw && typeof raw === 'object') {\n  message = raw.message || raw.description || raw.reason || message;\n  try { detail = JSON.stringify(raw, null, 2).slice(0, 4000); } catch (e) { detail = 'Could not serialize error payload.'; }\n} else {\n  try { detail = JSON.stringify(first, null, 2).slice(0, 4000); } catch (e) { detail = 'Could not serialize item.'; }\n}\n\nlet failedNode = 'unknown step';\ntry { if ($prevNode && $prevNode.name) failedNode = $prevNode.name; } catch (e) {}\n\nconst body = [\n  '**Cigar Stock Snapshot failed.**',\n  '',\n  `- Failed step: \\`${failedNode}\\``,\n  `- Time: ${stamp}`,\n  `- Execution ID: ${$execution.id}`,\n  '',\n  '### Error',\n  '```',\n  String(message),\n  '```',\n  '',\n  '### Raw payload',\n  '```json',\n  detail,\n  '```',\n  '',\n  '---',\n  'No stock file was written, so the Cigar Sales Tally has no stock figures to join against.'\n].join('\\n');\n\nreturn [{\n  json: {\n    issue_title: `Cigar Stock Snapshot failed at ${failedNode} - ${now.toFormat('yyyy-MM-dd')}`,\n    issue_body: body\n  }\n}];"
+      },
+      "id": "b8c9d0e1-0009-4000-8000-000000000089",
+      "name": "Build Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1100, 240]
+    },
+    {
+      "parameters": {
+        "resource": "issue",
+        "operation": "create",
+        "owner": { "__rl": true, "value": "1JKT1", "mode": "name" },
+        "repository": { "__rl": true, "value": "abbies-data", "mode": "name" },
+        "title": "={{ $json.issue_title }}",
+        "body": "={{ $json.issue_body }}",
+        "labels": [],
+        "assignees": []
+      },
+      "id": "b8c9d0e1-0010-4000-8000-000000000090",
+      "name": "Report Failure",
+      "type": "n8n-nodes-base.github",
+      "typeVersion": 1,
+      "position": [1320, 240],
+      "credentials": { "githubApi": { "name": "GitHub Abbies Data" } }
+    }
+  ],
+  "connections": {
+    "Weekly Trigger": { "main": [[{ "node": "Build Window", "type": "main", "index": 0 }]] },
+    "Build Window": {
+      "main": [
+        [{ "node": "Fetch Categories", "type": "main", "index": 0 }],
+        [{ "node": "Build Alert", "type": "main", "index": 0 }]
+      ]
+    },
+    "Fetch Categories": {
+      "main": [
+        [{ "node": "Find Cigars Category", "type": "main", "index": 0 }],
+        [{ "node": "Build Alert", "type": "main", "index": 0 }]
+      ]
+    },
+    "Find Cigars Category": {
+      "main": [
+        [{ "node": "Fetch Items", "type": "main", "index": 0 }],
+        [{ "node": "Build Alert", "type": "main", "index": 0 }]
+      ]
+    },
+    "Fetch Items": {
+      "main": [
+        [{ "node": "Build Stock CSV", "type": "main", "index": 0 }],
+        [{ "node": "Build Alert", "type": "main", "index": 0 }]
+      ]
+    },
+    "Build Stock CSV": {
+      "main": [
+        [{ "node": "Create Stock File", "type": "main", "index": 0 }],
+        [{ "node": "Build Alert", "type": "main", "index": 0 }]
+      ]
+    },
+    "Create Stock File": {
+      "main": [
+        [],
+        [{ "node": "Update Stock File", "type": "main", "index": 0 }]
+      ]
+    },
+    "Update Stock File": {
+      "main": [
+        [],
+        [{ "node": "Build Alert", "type": "main", "index": 0 }]
+      ]
+    },
+    "Build Alert": { "main": [[{ "node": "Report Failure", "type": "main", "index": 0 }]] }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "America/New_York"
+  }
+}
