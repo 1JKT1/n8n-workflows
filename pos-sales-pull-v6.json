@@ -1,0 +1,207 @@
+{
+  "name": "POS Sales Pull v6",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 1 * * 0"
+            }
+          ]
+        }
+      },
+      "id": "f6a7b8c9-0001-4000-8000-000000000051",
+      "name": "Weekly Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Compute the last COMPLETE week: Sunday 00:00:00 through Saturday 23:59:59\n// in store local time (America/New_York). Luxon handles DST automatically,\n// so this stays correct when the offset shifts from -04:00 to -05:00.\n\nconst now = $now.setZone('America/New_York');\n\n// Luxon weekday: Mon=1 ... Sun=7. Convert so Sun=0 ... Sat=6.\nconst dayOfWeek = now.weekday % 7;\n\n// Sunday that begins the CURRENT week\nconst currentWeekStart = now.minus({ days: dayOfWeek }).startOf('day');\n\n// The completed week is the one before it\nconst weekStart = currentWeekStart.minus({ days: 7 });\nconst weekEnd = currentWeekStart.minus({ seconds: 1 });\n\nconst fmt = \"yyyy-MM-dd'T'HH:mm:ssZZ\";\n\n// Filing rule: file by END DATE. A week straddling a month or year boundary\n// files under the month it CLOSES in.\nconst year = weekEnd.toFormat('yyyy');\nconst month = weekEnd.toFormat('MM-MMMM');\nconst fileName = weekEnd.toFormat('yyyy-MM-dd') + '-weekly-sales.json';\n\nreturn [{\n  json: {\n    start_date: weekStart.toFormat(fmt),\n    end_date: weekEnd.toFormat(fmt),\n    week_start_label: weekStart.toFormat('yyyy-MM-dd'),\n    week_end_label: weekEnd.toFormat('yyyy-MM-dd'),\n    file_path: `business-decisions-data/detailed-sales-report/${year}/${month}/${fileName}`,\n    generated_at: now.toFormat(fmt)\n  }\n}];"
+      },
+      "id": "f6a7b8c9-0002-4000-8000-000000000052",
+      "name": "Build Window",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [0, 200],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "url": "=https://abbiescigars.phppointofsale.com/index.php/api/v1/sales?start_date={{ $json.start_date }}&end_date={{ $json.end_date }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {}
+      },
+      "id": "f6a7b8c9-0003-4000-8000-000000000053",
+      "name": "Fetch Sales",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [220, 200],
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "PHP POS API v2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build the weekly file: metadata, computed summary, and trimmed line items.\n// Full raw payload is ~800KB per week; trimming keeps the repo manageable\n// while retaining every field the inventory analyst needs.\n\nconst win = $('Build Window').all()[0].json;\nconst sales = items.map(i => i.json);\n\nif (!sales.length) {\n  throw new Error('No sales returned for ' + win.week_start_label + ' to ' + win.week_end_label);\n}\n\nconst round = n => Math.round(n * 100) / 100;\n\nconst categories = {};\nconst cigars = {};\nconst lineItems = [];\n\nlet grossTotal = 0;\n\nfor (const sale of sales) {\n  grossTotal += Number(sale.total || 0);\n\n  for (const c of (sale.cart_items || [])) {\n    const qty = Number(c.quantity || 0);\n    const unit = Number(c.unit_price || 0);\n    const cost = Number(c.cost_price || 0);\n    const cat = c.category_name || '(uncategorized)';\n    const revenue = unit * qty;\n    const cogs = cost * qty;\n\n    if (!categories[cat]) categories[cat] = { units: 0, revenue: 0, cost: 0, margin: 0 };\n    categories[cat].units += qty;\n    categories[cat].revenue += revenue;\n    categories[cat].cost += cogs;\n    categories[cat].margin += (revenue - cogs);\n\n    if (cat === 'Cigars') {\n      const key = c.item_number || c.item_id;\n      if (!cigars[key]) {\n        cigars[key] = { item_id: c.item_id, item_number: c.item_number, name: c.name, units: 0, revenue: 0, cost: 0, margin: 0 };\n      }\n      cigars[key].units += qty;\n      cigars[key].revenue += revenue;\n      cigars[key].cost += cogs;\n      cigars[key].margin += (revenue - cogs);\n    }\n\n    lineItems.push({\n      sale_id: sale.sale_id,\n      sale_time: sale.sale_time,\n      item_id: c.item_id,\n      item_number: c.item_number,\n      name: c.name,\n      category_name: cat,\n      quantity: qty,\n      unit_price: unit,\n      regular_price: Number(c.regular_price || 0),\n      cost_price: cost,\n      discount: Number(c.discount || 0)\n    });\n  }\n}\n\nfor (const k of Object.keys(categories)) {\n  categories[k].revenue = round(categories[k].revenue);\n  categories[k].cost = round(categories[k].cost);\n  categories[k].margin = round(categories[k].margin);\n}\nfor (const k of Object.keys(cigars)) {\n  cigars[k].revenue = round(cigars[k].revenue);\n  cigars[k].cost = round(cigars[k].cost);\n  cigars[k].margin = round(cigars[k].margin);\n}\n\nconst cigarList = Object.values(cigars).sort((a, b) => b.units - a.units);\n\nconst payload = {\n  meta: {\n    report: 'detailed sales report',\n    week_start: win.week_start_label,\n    week_end: win.week_end_label,\n    start_date: win.start_date,\n    end_date: win.end_date,\n    timezone: 'America/New_York',\n    filed_by: 'end date',\n    generated_at: win.generated_at,\n    source: 'PHP Point of Sale /api/v1/sales'\n  },\n  summary: {\n    transaction_count: sales.length,\n    gross_total: round(grossTotal),\n    distinct_cigar_skus: cigarList.length,\n    categories\n  },\n  cigars: cigarList,\n  line_items: lineItems\n};\n\nreturn [{\n  json: {\n    file_path: win.file_path,\n    week_label: `${win.week_start_label} to ${win.week_end_label}`,\n    commit_message: `Weekly sales ${win.week_start_label} to ${win.week_end_label} (${sales.length} transactions)`,\n    file_content: JSON.stringify(payload, null, 2)\n  }\n}];"
+      },
+      "id": "f6a7b8c9-0004-4000-8000-000000000054",
+      "name": "Build File",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 200],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "resource": "file",
+        "operation": "create",
+        "owner": {
+          "__rl": true,
+          "value": "1JKT1",
+          "mode": "name"
+        },
+        "repository": {
+          "__rl": true,
+          "value": "abbies-data",
+          "mode": "name"
+        },
+        "filePath": "={{ $json.file_path }}",
+        "binaryData": false,
+        "fileContent": "={{ $json.file_content }}",
+        "commitMessage": "={{ $json.commit_message }}"
+      },
+      "id": "f6a7b8c9-0005-4000-8000-000000000055",
+      "name": "Create Weekly File",
+      "type": "n8n-nodes-base.github",
+      "typeVersion": 1,
+      "position": [660, 200],
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "githubApi": {
+          "name": "GitHub Abbies Data"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "file",
+        "operation": "edit",
+        "owner": {
+          "__rl": true,
+          "value": "1JKT1",
+          "mode": "name"
+        },
+        "repository": {
+          "__rl": true,
+          "value": "abbies-data",
+          "mode": "name"
+        },
+        "filePath": "={{ $('Build File').all()[0].json.file_path }}",
+        "binaryData": false,
+        "fileContent": "={{ $('Build File').all()[0].json.file_content }}",
+        "commitMessage": "={{ $('Build File').all()[0].json.commit_message }} [rerun]"
+      },
+      "id": "f6a7b8c9-0006-4000-8000-000000000056",
+      "name": "Update Weekly File",
+      "type": "n8n-nodes-base.github",
+      "typeVersion": 1,
+      "position": [880, 200],
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "githubApi": {
+          "name": "GitHub Abbies Data"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Any node's error output lands here. The error arrives on json.error and may\n// be a plain string OR an object, depending on which node threw, so handle both.\n\nconst now = $now.setZone('America/New_York');\nconst stamp = now.toFormat('yyyy-MM-dd HH:mm:ss ZZZZ');\n\nconst first = (items && items[0] && items[0].json) ? items[0].json : {};\nconst raw = first.error;\n\nlet message = 'No error message available';\nlet detail = '';\n\nif (typeof raw === 'string') {\n  message = raw;\n  detail = raw;\n} else if (raw && typeof raw === 'object') {\n  message = raw.message || raw.description || raw.reason || message;\n  try {\n    detail = JSON.stringify(raw, null, 2).slice(0, 4000);\n  } catch (e) {\n    detail = 'Could not serialize error payload.';\n  }\n} else {\n  try {\n    detail = JSON.stringify(first, null, 2).slice(0, 4000);\n  } catch (e) {\n    detail = 'Could not serialize item.';\n  }\n}\n\n// Which node fed this alert.\nlet failedNode = 'unknown step';\ntry {\n  if ($prevNode && $prevNode.name) failedNode = $prevNode.name;\n} catch (e) {}\n\n// Target week. .all() avoids the paired-item lookup that breaks on error branches.\nlet weekLabel = 'unknown';\ntry {\n  const w = $('Build Window').all();\n  if (w.length) weekLabel = `${w[0].json.week_start_label} to ${w[0].json.week_end_label}`;\n} catch (e) {}\nif (weekLabel === 'unknown' && first.week_label) weekLabel = first.week_label;\n\nlet filePath = first.file_path || 'not determined';\n\nconst body = [\n  '**POS Sales Pull failed.**',\n  '',\n  `- Failed step: \\`${failedNode}\\``,\n  `- Time: ${stamp}`,\n  `- Target week: ${weekLabel}`,\n  `- Target file: \\`${filePath}\\``,\n  `- Execution ID: ${$execution.id}`,\n  '',\n  '### Error',\n  '```',\n  String(message),\n  '```',\n  '',\n  '### Raw payload',\n  '```json',\n  detail,\n  '```',\n  '',\n  '---',\n  'No weekly sales file was written for this run. Monday ordering has no report until this is resolved.'\n].join('\\n');\n\nreturn [{\n  json: {\n    issue_title: `POS Sales Pull failed at ${failedNode} - ${now.toFormat('yyyy-MM-dd')}`,\n    issue_body: body\n  }\n}];"
+      },
+      "id": "f6a7b8c9-0007-4000-8000-000000000057",
+      "name": "Build Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [660, 420]
+    },
+    {
+      "parameters": {
+        "resource": "issue",
+        "operation": "create",
+        "owner": {
+          "__rl": true,
+          "value": "1JKT1",
+          "mode": "name"
+        },
+        "repository": {
+          "__rl": true,
+          "value": "abbies-data",
+          "mode": "name"
+        },
+        "title": "={{ $json.issue_title }}",
+        "body": "={{ $json.issue_body }}",
+        "labels": [],
+        "assignees": []
+      },
+      "id": "f6a7b8c9-0008-4000-8000-000000000058",
+      "name": "Report Failure",
+      "type": "n8n-nodes-base.github",
+      "typeVersion": 1,
+      "position": [880, 420],
+      "credentials": {
+        "githubApi": {
+          "name": "GitHub Abbies Data"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Weekly Trigger": {
+      "main": [[{ "node": "Build Window", "type": "main", "index": 0 }]]
+    },
+    "Build Window": {
+      "main": [
+        [{ "node": "Fetch Sales", "type": "main", "index": 0 }],
+        [{ "node": "Build Alert", "type": "main", "index": 0 }]
+      ]
+    },
+    "Fetch Sales": {
+      "main": [
+        [{ "node": "Build File", "type": "main", "index": 0 }],
+        [{ "node": "Build Alert", "type": "main", "index": 0 }]
+      ]
+    },
+    "Build File": {
+      "main": [
+        [{ "node": "Create Weekly File", "type": "main", "index": 0 }],
+        [{ "node": "Build Alert", "type": "main", "index": 0 }]
+      ]
+    },
+    "Create Weekly File": {
+      "main": [
+        [],
+        [{ "node": "Update Weekly File", "type": "main", "index": 0 }]
+      ]
+    },
+    "Update Weekly File": {
+      "main": [
+        [],
+        [{ "node": "Build Alert", "type": "main", "index": 0 }]
+      ]
+    },
+    "Build Alert": {
+      "main": [[{ "node": "Report Failure", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "America/New_York"
+  }
+}
