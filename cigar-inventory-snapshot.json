@@ -1,0 +1,274 @@
+{
+  "name": "Cigar Inventory Snapshot",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 2 * * 0"
+            }
+          ]
+        }
+      },
+      "id": "a7b8c9d0-0001-4000-8000-000000000061",
+      "name": "Weekly Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Trailing 90-day window ending at the close of the last complete week.\n// One week of sales is too short to judge whether a SKU is dead; 90 days is.\n// The window ENDS on the same Saturday 23:59:59 that the weekly report uses,\n// so both files describe the same cut-off moment.\n\nconst now = $now.setZone('America/New_York');\nconst dayOfWeek = now.weekday % 7;\nconst currentWeekStart = now.minus({ days: dayOfWeek }).startOf('day');\n\nconst windowEnd = currentWeekStart.minus({ seconds: 1 });\nconst windowStart = windowEnd.minus({ days: 90 }).startOf('day');\n\nconst fmt = \"yyyy-MM-dd'T'HH:mm:ssZZ\";\n\nconst year = windowEnd.toFormat('yyyy');\nconst month = windowEnd.toFormat('MM-MMMM');\nconst fileName = windowEnd.toFormat('yyyy-MM-dd') + '-cigar-inventory.csv';\n\nreturn [{\n  json: {\n    start_date: windowStart.toFormat(fmt),\n    end_date: windowEnd.toFormat(fmt),\n    window_start_label: windowStart.toFormat('yyyy-MM-dd'),\n    window_end_label: windowEnd.toFormat('yyyy-MM-dd'),\n    period_days: Math.round(windowEnd.diff(windowStart, 'days').days),\n    file_path: `business-decisions-data/cigar-inventory/${year}/${month}/${fileName}`,\n    generated_at: now.toFormat(fmt)\n  }\n}];"
+      },
+      "id": "a7b8c9d0-0002-4000-8000-000000000062",
+      "name": "Build Window",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [220, 0],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "url": "https://abbiescigars.phppointofsale.com/index.php/api/v1/categories?limit=100",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {}
+      },
+      "id": "a7b8c9d0-0003-4000-8000-000000000063",
+      "name": "Fetch Categories",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [440, 0],
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "PHP POS API v2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Find the Cigars category id. Items carry category_id, not a name, so the\n// id has to be resolved before the item list can be filtered.\n\nconst cats = items.map(i => i.json);\nconst match = cats.find(c => String(c.name || '').trim().toLowerCase() === 'cigars');\n\nif (!match) {\n  const names = cats.map(c => c.name).join(', ');\n  throw new Error('No category named \"Cigars\" found. Categories present: ' + names);\n}\n\nreturn [{\n  json: {\n    category_id: match.category_id,\n    category_name: match.name\n  }\n}];"
+      },
+      "id": "a7b8c9d0-0004-4000-8000-000000000064",
+      "name": "Find Cigars Category",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [660, 0],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "url": "=https://abbiescigars.phppointofsale.com/index.php/api/v1/items?category_id={{ $json.category_id }}&limit=1000",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {}
+      },
+      "id": "a7b8c9d0-0005-4000-8000-000000000065",
+      "name": "Fetch Items",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [880, 0],
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "PHP POS API v2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "=https://abbiescigars.phppointofsale.com/index.php/api/v1/sales?start_date={{ $('Build Window').all()[0].json.start_date }}&end_date={{ $('Build Window').all()[0].json.end_date }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {}
+      },
+      "id": "a7b8c9d0-0006-4000-8000-000000000066",
+      "name": "Fetch Sales 90d",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1100, 0],
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "PHP POS API v2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Join 90 days of cigar sales to current stock and emit the CSV the\n// weekly-cigar-inventory-analyst skill expects:\n//   sku, name, units_sold, on_hand, unit_cost\n// Every cigar the shop CARRIES is a row, including ones that sold nothing.\n// Those are the whole point of the exercise.\n\nconst win = $('Build Window').all()[0].json;\nconst itemRows = $('Fetch Items').all().map(i => i.json);\nconst sales = items.map(i => i.json);\n\nif (!itemRows.length) {\n  throw new Error('No cigar items returned from /items.');\n}\n\n// Sum units sold per item_id across the window, cigars only.\nconst sold = {};\nfor (const sale of sales) {\n  for (const c of (sale.cart_items || [])) {\n    if ((c.category_name || '') !== 'Cigars') continue;\n    const id = String(c.item_id);\n    sold[id] = (sold[id] || 0) + Number(c.quantity || 0);\n  }\n}\n\n// On-hand lives under item.locations, keyed by location, each with a quantity.\nfunction onHandFor(item) {\n  const loc = item.locations;\n  if (!loc || typeof loc !== 'object') return 0;\n  let total = 0;\n  for (const k of Object.keys(loc)) {\n    const q = loc[k] && loc[k].quantity;\n    const n = Number(q);\n    if (!isNaN(n)) total += n;\n  }\n  return total;\n}\n\nfunction csvCell(v) {\n  const s = String(v === null || v === undefined ? '' : v);\n  return /[\",\\n]/.test(s) ? '\"' + s.replace(/\"/g, '\"\"') + '\"' : s;\n}\n\nconst lines = ['sku,name,units_sold,on_hand,unit_cost'];\nlet carried = 0;\nlet zeroSellers = 0;\n\nfor (const item of itemRows) {\n  if (item.item_inactive === true) continue;\n  carried++;\n\n  const id = String(item.item_id);\n  const units = Math.round(sold[id] || 0);\n  const onHand = Math.max(0, Math.round(onHandFor(item)));\n  const cost = Number(item.cost_price || 0);\n\n  if (units === 0) zeroSellers++;\n\n  lines.push([\n    csvCell(item.item_number || item.item_id),\n    csvCell(item.name),\n    units,\n    onHand,\n    cost.toFixed(2)\n  ].join(','));\n}\n\nconst csv = lines.join('\\n') + '\\n';\n\nreturn [{\n  json: {\n    file_path: win.file_path,\n    window_label: `${win.window_start_label} to ${win.window_end_label}`,\n    period_days: win.period_days,\n    carried_skus: carried,\n    zero_sellers: zeroSellers,\n    commit_message: `Cigar inventory snapshot ${win.window_end_label} (${carried} SKUs, ${win.period_days}-day window)`,\n    file_content: csv\n  }\n}];"
+      },
+      "id": "a7b8c9d0-0007-4000-8000-000000000067",
+      "name": "Build Inventory CSV",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1320, 0],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "resource": "file",
+        "operation": "create",
+        "owner": {
+          "__rl": true,
+          "value": "1JKT1",
+          "mode": "name"
+        },
+        "repository": {
+          "__rl": true,
+          "value": "abbies-data",
+          "mode": "name"
+        },
+        "filePath": "={{ $json.file_path }}",
+        "binaryData": false,
+        "fileContent": "={{ $json.file_content }}",
+        "commitMessage": "={{ $json.commit_message }}"
+      },
+      "id": "a7b8c9d0-0008-4000-8000-000000000068",
+      "name": "Create Snapshot",
+      "type": "n8n-nodes-base.github",
+      "typeVersion": 1,
+      "position": [1540, 0],
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "githubApi": {
+          "name": "GitHub Abbies Data"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "file",
+        "operation": "edit",
+        "owner": {
+          "__rl": true,
+          "value": "1JKT1",
+          "mode": "name"
+        },
+        "repository": {
+          "__rl": true,
+          "value": "abbies-data",
+          "mode": "name"
+        },
+        "filePath": "={{ $('Build Inventory CSV').all()[0].json.file_path }}",
+        "binaryData": false,
+        "fileContent": "={{ $('Build Inventory CSV').all()[0].json.file_content }}",
+        "commitMessage": "={{ $('Build Inventory CSV').all()[0].json.commit_message }} [rerun]"
+      },
+      "id": "a7b8c9d0-0009-4000-8000-000000000069",
+      "name": "Update Snapshot",
+      "type": "n8n-nodes-base.github",
+      "typeVersion": 1,
+      "position": [1760, 0],
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "githubApi": {
+          "name": "GitHub Abbies Data"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Shared failure handler for every step in this workflow.\n\nconst now = $now.setZone('America/New_York');\nconst stamp = now.toFormat('yyyy-MM-dd HH:mm:ss ZZZZ');\n\nconst first = (items && items[0] && items[0].json) ? items[0].json : {};\nconst raw = first.error;\n\nlet message = 'No error message available';\nlet detail = '';\n\nif (typeof raw === 'string') {\n  message = raw;\n  detail = raw;\n} else if (raw && typeof raw === 'object') {\n  message = raw.message || raw.description || raw.reason || message;\n  try {\n    detail = JSON.stringify(raw, null, 2).slice(0, 4000);\n  } catch (e) {\n    detail = 'Could not serialize error payload.';\n  }\n} else {\n  try {\n    detail = JSON.stringify(first, null, 2).slice(0, 4000);\n  } catch (e) {\n    detail = 'Could not serialize item.';\n  }\n}\n\nlet failedNode = 'unknown step';\ntry {\n  if ($prevNode && $prevNode.name) failedNode = $prevNode.name;\n} catch (e) {}\n\nlet windowLabel = 'unknown';\ntry {\n  const w = $('Build Window').all();\n  if (w.length) windowLabel = `${w[0].json.window_start_label} to ${w[0].json.window_end_label}`;\n} catch (e) {}\n\nconst body = [\n  '**Cigar Inventory Snapshot failed.**',\n  '',\n  `- Failed step: \\`${failedNode}\\``,\n  `- Time: ${stamp}`,\n  `- Window: ${windowLabel}`,\n  `- Execution ID: ${$execution.id}`,\n  '',\n  '### Error',\n  '```',\n  String(message),\n  '```',\n  '',\n  '### Raw payload',\n  '```json',\n  detail,\n  '```',\n  '',\n  '---',\n  'No inventory snapshot was written. The reorder and discontinue analysis has no input until this is resolved.'\n].join('\\n');\n\nreturn [{\n  json: {\n    issue_title: `Cigar Inventory Snapshot failed at ${failedNode} - ${now.toFormat('yyyy-MM-dd')}`,\n    issue_body: body\n  }\n}];"
+      },
+      "id": "a7b8c9d0-0010-4000-8000-000000000070",
+      "name": "Build Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1320, 240]
+    },
+    {
+      "parameters": {
+        "resource": "issue",
+        "operation": "create",
+        "owner": {
+          "__rl": true,
+          "value": "1JKT1",
+          "mode": "name"
+        },
+        "repository": {
+          "__rl": true,
+          "value": "abbies-data",
+          "mode": "name"
+        },
+        "title": "={{ $json.issue_title }}",
+        "body": "={{ $json.issue_body }}",
+        "labels": [],
+        "assignees": []
+      },
+      "id": "a7b8c9d0-0011-4000-8000-000000000071",
+      "name": "Report Failure",
+      "type": "n8n-nodes-base.github",
+      "typeVersion": 1,
+      "position": [1540, 240],
+      "credentials": {
+        "githubApi": {
+          "name": "GitHub Abbies Data"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Weekly Trigger": {
+      "main": [[{ "node": "Build Window", "type": "main", "index": 0 }]]
+    },
+    "Build Window": {
+      "main": [
+        [{ "node": "Fetch Categories", "type": "main", "index": 0 }],
+        [{ "node": "Build Alert", "type": "main", "index": 0 }]
+      ]
+    },
+    "Fetch Categories": {
+      "main": [
+        [{ "node": "Find Cigars Category", "type": "main", "index": 0 }],
+        [{ "node": "Build Alert", "type": "main", "index": 0 }]
+      ]
+    },
+    "Find Cigars Category": {
+      "main": [
+        [{ "node": "Fetch Items", "type": "main", "index": 0 }],
+        [{ "node": "Build Alert", "type": "main", "index": 0 }]
+      ]
+    },
+    "Fetch Items": {
+      "main": [
+        [{ "node": "Fetch Sales 90d", "type": "main", "index": 0 }],
+        [{ "node": "Build Alert", "type": "main", "index": 0 }]
+      ]
+    },
+    "Fetch Sales 90d": {
+      "main": [
+        [{ "node": "Build Inventory CSV", "type": "main", "index": 0 }],
+        [{ "node": "Build Alert", "type": "main", "index": 0 }]
+      ]
+    },
+    "Build Inventory CSV": {
+      "main": [
+        [{ "node": "Create Snapshot", "type": "main", "index": 0 }],
+        [{ "node": "Build Alert", "type": "main", "index": 0 }]
+      ]
+    },
+    "Create Snapshot": {
+      "main": [
+        [],
+        [{ "node": "Update Snapshot", "type": "main", "index": 0 }]
+      ]
+    },
+    "Update Snapshot": {
+      "main": [
+        [],
+        [{ "node": "Build Alert", "type": "main", "index": 0 }]
+      ]
+    },
+    "Build Alert": {
+      "main": [[{ "node": "Report Failure", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "America/New_York"
+  }
+}
