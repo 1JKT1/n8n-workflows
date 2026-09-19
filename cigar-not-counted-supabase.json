@@ -1,0 +1,80 @@
+{
+  "name": "Cigar Not Counted to Supabase",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 5 * * 0"
+            }
+          ]
+        }
+      },
+      "id": "d3000000-0000-4000-8000-000000000001",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "url": "https://abbiescigars.phppointofsale.com/index.php/api/v1/reports/inventory_not_scanned_during_count?start_date=2026-06-01&end_date=2026-09-30&limit=5000&offset=0",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {}
+      },
+      "id": "d3000000-0000-4000-8000-000000000002",
+      "name": "Fetch Not Scanned",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [220, 0],
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "url": "https://abbiescigars.phppointofsale.com/index.php/api/v1/items?category_id=2&limit=2000",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {}
+      },
+      "id": "d3000000-0000-4000-8000-000000000003",
+      "name": "Fetch Cigar Items",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [440, 0],
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Cigars category is id 2 (hardcoded). Both HTTP nodes are executeOnce,\n// so each POS endpoint is called exactly one time per run.\nconst report = $('Fetch Not Scanned').all().map(i => i.json);\nconst cigarItems = $('Fetch Cigar Items').all().map(i => i.json);\n\nconst cigarNumbers = new Set();\nconst cigarNames = new Set();\nfor (const it of cigarItems) {\n  if (it.item_inactive === true) continue;\n  if (it.item_number) cigarNumbers.add(String(it.item_number).trim().toLowerCase());\n  if (it.item_id) cigarNumbers.add(String(it.item_id).trim().toLowerCase());\n  if (it.name) cigarNames.add(String(it.name).trim().toLowerCase());\n}\n\nlet rows = [];\nfor (const r of report) {\n  if (r && r.data && Array.isArray(r.data.rows)) rows = rows.concat(r.data.rows);\n  else if (r && Array.isArray(r.details)) rows = rows.concat(r.details);\n  else if (r && r.data && Array.isArray(r.data)) rows = rows.concat(r.data);\n}\n\nfunction pick(obj, keys) {\n  for (const k of keys) {\n    for (const actual of Object.keys(obj)) {\n      if (actual.toLowerCase().replace(/[^a-z]/g,'') === k) return obj[actual];\n    }\n  }\n  return '';\n}\n\n// Run date in America/New_York, as YYYY-MM-DD\nconst snapshotDate = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });\n\nconst out = [];\nfor (const row of rows) {\n  const num = String(pick(row, ['itemnumber','sku','item','number','itemid']) || '').trim();\n  const nm  = String(pick(row, ['name','itemname','description']) || '').trim();\n  if (!((num && cigarNumbers.has(num.toLowerCase())) ||\n        (nm  && cigarNames.has(nm.toLowerCase())))) continue;\n\n  const qtyRaw = pick(row, ['quantity','onhand','instock','qty']);\n  const qty = qtyRaw === '' || qtyRaw === null || qtyRaw === undefined\n    ? null : Number(String(qtyRaw).replace(/[^0-9.\\-]/g, ''));\n\n  out.push({\n    json: {\n      snapshot_date: snapshotDate,\n      sku: num || null,\n      name: nm || null,\n      on_hand: (qty === null || isNaN(qty)) ? null : qty\n    }\n  });\n}\n\nif (out.length === 0) {\n  return [{ json: { snapshot_date: snapshotDate, sku: null, name: 'NO CIGARS RETURNED', on_hand: null } }];\n}\nreturn out;"
+      },
+      "id": "d3000000-0000-4000-8000-000000000004",
+      "name": "Build Rows",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [660, 0]
+    },
+    {
+      "parameters": {
+        "operation": "create",
+        "tableId": "cigar_count_snapshot",
+        "dataToSend": "autoMapInputData",
+        "options": {}
+      },
+      "id": "d3000000-0000-4000-8000-000000000005",
+      "name": "Insert Snapshot",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [880, 0]
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": { "main": [[{ "node": "Fetch Not Scanned", "type": "main", "index": 0 }]] },
+    "Fetch Not Scanned": { "main": [[{ "node": "Fetch Cigar Items", "type": "main", "index": 0 }]] },
+    "Fetch Cigar Items": { "main": [[{ "node": "Build Rows", "type": "main", "index": 0 }]] },
+    "Build Rows": { "main": [[{ "node": "Insert Snapshot", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1", "timezone": "America/New_York" }
+}
